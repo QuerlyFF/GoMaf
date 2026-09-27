@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ $EUID -eq 0 ]] || { echo "root required" >&2; exit 1; }
+
+MODE="${1:-}"
+case "$MODE" in
+  v10|v9|finalize) ;;
+  *) echo "usage: gomaf-v10-admin-switch v10|v9|finalize" >&2; exit 2 ;;
+esac
+
+ENV=/etc/gomaf/production.env
+STATE=/etc/gomaf/v10-v9-admin-username
+[[ -f "$ENV" && ! -L "$ENV" ]] || { echo "production.env missing or unsafe" >&2; exit 1; }
+[[ -f "$STATE" && ! -L "$STATE" ]] || { echo "v9 ADMIN state missing or unsafe" >&2; exit 1; }
+
+if [[ "$MODE" == finalize ]]; then
+  current="$(grep -m1 '^APP_ADMIN_USERNAME=' "$ENV" | cut -d= -f2- | tr -d '\r' || true)"
+  current="${current#\"}"; current="${current%\"}"
+  current="${current#\'}"; current="${current%\'}"
+  [[ "$current" == admin ]] || { echo "refusing finalize: APP_ADMIN_USERNAME is not admin" >&2; exit 1; }
+  rm -f -- "$STATE"
+  python3 - "$(dirname "$STATE")" <<'PYFSYNC'
+import os, sys
+fd=os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PYFSYNC
+  echo "v10 ADMIN transition finalized"
+  exit 0
+fi
+
+python3 - "$ENV" "$STATE" "$MODE" <<'PY' 
+from pathlib import Path
+import os
+import re
+import sys
+import tempfile
+
+env = Path(sys.argv[1])
+state = Path(sys.argv[2])
+mode = sys.argv[3]
+old_admin = state.read_text(encoding='utf-8').strip()
+if not re.fullmatch(r'[A-Za-zА-Яа-яЁё0-9_]{3,32}', old_admin):
+    raise SystemExit('unsafe v9 ADMIN username state')
+target = 'admin' if mode == 'v10' else old_admin
+
+lines = env.read_text(encoding='utf-8').splitlines()
+out = []
+found = False
+for line in lines:
+    if line.startswith('APP_ADMIN_USERNAME='):
+        out.append('APP_ADMIN_USERNAME=' + target)
+        found = True
+    else:
+        out.append(line)
+if not found:
+    raise SystemExit('APP_ADMIN_USERNAME missing in production.env')
+
+fd, tmp_name = tempfile.mkstemp(prefix='.production.env.', dir=str(env.parent), text=True)
+try:
+    with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as handle:
+        handle.write('\n'.join(out) + '\n')
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chown(tmp_name, 0, env.stat().st_gid)
+    os.chmod(tmp_name, 0o640)
+    os.replace(tmp_name, env)
+    dir_fd = os.open(env.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+finally:
+    try:
+        os.unlink(tmp_name)
+    except FileNotFoundError:
+        pass
+print(f'APP_ADMIN_USERNAME switched to {target}')
+PY

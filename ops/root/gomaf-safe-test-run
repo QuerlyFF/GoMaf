@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if (( $# < 4 )); then
+  echo "usage: gomaf-safe-test-run NAME MEMORY_MIB CPUS [docker-run-options...] IMAGE [command...]" >&2
+  exit 64
+fi
+
+name="$1"
+memory_mib="$2"
+cpus="$3"
+shift 3
+
+[[ "$name" =~ ^gomaf-(stage[0-9]+|predeploy|rehearsal|deploy)-[a-zA-Z0-9_.-]+$ ]] || {
+  echo "invalid test container name: $name" >&2
+  exit 64
+}
+[[ "$memory_mib" =~ ^[0-9]+$ ]] || {
+  echo "MEMORY_MIB must be an integer" >&2
+  exit 64
+}
+if (( memory_mib < 64 || memory_mib > 1024 )); then
+  echo "MEMORY_MIB must be between 64 and 1024" >&2
+  exit 64
+fi
+awk -v x="$cpus" 'BEGIN {exit !(x > 0 && x <= 1.0)}' || {
+  echo "CPUS must be >0 and <=1.0" >&2
+  exit 64
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    --memory|--memory=*|--memory-reservation|--memory-reservation=*|--memory-swap|--memory-swap=*|--cpus|--cpus=*|--cpu-quota|--cpu-quota=*|--cpu-period|--cpu-period=*|--pids-limit|--pids-limit=*|--cgroup-parent|--cgroup-parent=*|--restart|--restart=*|--oom-kill-disable|--oom-kill-disable=*|--name|--name=*|--privileged|--pid=host|--ipc=host|--uts=host)
+      echo "unsafe/overriding docker option rejected: $arg" >&2
+      exit 64
+      ;;
+  esac
+done
+
+run_preflight() {
+  local here
+  if [[ -x /usr/local/sbin/gomaf-test-preflight ]]; then
+    /usr/local/sbin/gomaf-test-preflight >&2
+    return
+  fi
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  [[ -x "$here/gomaf-test-preflight" ]] || {
+    echo "gomaf-test-preflight unavailable" >&2
+    exit 1
+  }
+  "$here/gomaf-test-preflight" >&2
+}
+
+run_preflight
+
+reservation_mib=$((memory_mib * 3 / 4))
+swap_mib=$((memory_mib + 256))
+cgroup_args=()
+if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet gomaf-testing.slice 2>/dev/null; then
+  cgroup_args=(--cgroup-parent=gomaf-testing.slice)
+fi
+
+exec /usr/bin/docker run \
+  --name "$name" \
+  --restart=no \
+  "${cgroup_args[@]}" \
+  --memory="${memory_mib}m" \
+  --memory-reservation="${reservation_mib}m" \
+  --memory-swap="${swap_mib}m" \
+  --cpus="$cpus" \
+  --pids-limit=512 \
+  "$@"

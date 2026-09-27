@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ $EUID -eq 0 ]] || { echo "root required" >&2; exit 1; }
+
+APP_LOG=/srv/gomaf-logs/app
+CADDY_LOG=/srv/gomaf-logs/caddy
+EXPORT_DIR=/srv/gomaf-log-exports
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+TMP="$(mktemp -d /tmp/gomaf-log-export.XXXXXX)"
+OUT="$EXPORT_DIR/gomaf-logs-$STAMP.tar.gz"
+trap 'rm -rf -- "$TMP"' EXIT
+
+install -d -m 0750 -o mafia -g gomaf "$EXPORT_DIR"
+install -d -m 0700 "$TMP/app" "$TMP/caddy" "$TMP/diagnostics"
+
+# Copy only known log files. Never copy /etc/gomaf, application config, Docker env,
+# database dumps, SSH material or any source .env file.
+find "$APP_LOG" -maxdepth 1 -type f \
+  \( -name 'application.log' -o -name 'application.*.log.gz' -o -name 'audit.log' -o -name 'audit.*.log.gz' \) \
+  -exec cp -a -- {} "$TMP/app/" \; 2>/dev/null || true
+find "$CADDY_LOG" -maxdepth 1 -type f \
+  \( -name 'access.log' -o -name 'access-*.log' -o -name 'access-*.log.gz' \) \
+  -exec cp -a -- {} "$TMP/caddy/" \; 2>/dev/null || true
+
+{
+  echo "generated_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "hostname=$(hostname)"
+  echo "kernel=$(uname -srmo)"
+  echo "disk_root=$(df -P / | tail -1)"
+  echo "disk_backups=$(df -P /srv/gomaf-backups 2>/dev/null | tail -1 || true)"
+} > "$TMP/diagnostics/system.txt"
+
+docker ps --format '{{.Names}}\t{{.Image}}\t{{.Status}}' > "$TMP/diagnostics/docker-ps.tsv" 2>&1 || true
+systemctl --no-pager --plain status gomaf-backup.timer gomaf-storage-maintenance.timer \
+  > "$TMP/diagnostics/systemd-status.txt" 2>&1 || true
+journalctl --no-pager --since '-24 hours' -u gomaf-backup.service -u gomaf-storage-maintenance.service \
+  > "$TMP/diagnostics/maintenance-journal.txt" 2>&1 || true
+
+# Defense in depth: logs should never contain credentials, but an export must
+# remain safe even if an upstream component accidentally logged one. Redact
+# exact configured secret values in the copied tree and prove none remain.
+python3 - /etc/gomaf/production.env "$TMP" <<'PYREDACT'
+from pathlib import Path
+import sys
+
+env_path=Path(sys.argv[1])
+root=Path(sys.argv[2])
+keys={
+    'APP_ADMIN_PASSWORD',
+    'POSTGRES_PASSWORD',
+    'APP_DB_PASSWORD',
+    'APP_SECURITY_IP_HASH_SECRET',
+}
+values={}
+for raw in env_path.read_text(encoding='utf-8').splitlines():
+    if not raw or raw.lstrip().startswith('#') or '=' not in raw:
+        continue
+    key,value=raw.split('=',1)
+    if key not in keys:
+        continue
+    value=value.rstrip('\r')
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        value=value[1:-1]
+    if value:
+        values[key]=value.encode('utf-8')
+missing=keys-values.keys()
+if missing:
+    raise SystemExit('missing required secret keys: ' + ','.join(sorted(missing)))
+
+counts={key:0 for key in sorted(keys)}
+marker=b'[REDACTED_PRODUCTION_SECRET]'
+for path in root.rglob('*'):
+    if not path.is_file():
+        continue
+    data=path.read_bytes()
+    updated=data
+    for key,secret in values.items():
+        count=updated.count(secret)
+        if count:
+            counts[key]+=count
+            updated=updated.replace(secret, marker)
+    if updated != data:
+        path.write_bytes(updated)
+
+# A second pass is the actual fail-closed proof. Never print secret bytes.
+for path in root.rglob('*'):
+    if not path.is_file():
+        continue
+    data=path.read_bytes()
+    for key,secret in values.items():
+        if secret in data:
+            raise SystemExit(f'secret redaction failed for {key} in {path.relative_to(root)}')
+
+report=root/'diagnostics'/'redaction-report.txt'
+report.write_text(''.join(f'{key}={counts[key]}\n' for key in sorted(counts)), encoding='utf-8')
+PYREDACT
+
+cat > "$TMP/README.txt" <<'TXT'
+GoMaf production log export.
+Contains application/audit/access logs and bounded host diagnostics.
+Does not include /etc/gomaf/production.env, database dumps or SSH keys.
+Exact configured production secret values are redacted from copied logs before packaging and re-checked fail-closed.
+TXT
+
+(
+  cd "$TMP"
+  find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+  tar --numeric-owner --owner=0 --group=0 -czf "$OUT.tmp" .
+)
+mv "$OUT.tmp" "$OUT"
+chown mafia:gomaf "$OUT"
+chmod 0600 "$OUT"
+printf '%s\n' "$OUT"

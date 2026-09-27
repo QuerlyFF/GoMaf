@@ -1,0 +1,7 @@
+artifact=Cristalix-Mafia-v10.2.1-production-ubuntu
+source_basis=GoMaf v10.2.0 attached production source tree plus subsequent verified fixes
+platform=Ubuntu production only
+contains_production_secrets=no
+runtime_verification_local=not_available
+required_deploy_gate=mvn verify in Docker build + isolated production-DB migration rehearsal + candidate smoke/security checks
+source_audit=must_pass_after_extraction

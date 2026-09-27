@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+unit="${1:-unknown}"
+state_dir=/var/lib/gomaf-ops-health
+mkdir -p "$state_dir"
+chmod 0700 "$state_dir"
+
+ts="$(date -u +%FT%TZ)"
+active="$(systemctl show "$unit" -p ActiveState --value 2>/dev/null || true)"
+result="$(systemctl show "$unit" -p Result --value 2>/dev/null || true)"
+status="$(systemctl show "$unit" -p ExecMainStatus --value 2>/dev/null || true)"
+line="timestamp=$ts unit=$unit active=${active:-unknown} result=${result:-unknown} exec_status=${status:-unknown}"
+
+printf '%s\n' "$line" >> "$state_dir/failures.log"
+printf '%s\n' "$line" > "$state_dir/last-failure"
+chmod 0600 "$state_dir/failures.log" "$state_dir/last-failure"
+/usr/bin/logger -p daemon.err -t gomaf-ops-alert -- "$line"

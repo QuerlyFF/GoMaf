@@ -1,0 +1,224 @@
+name: gomaf
+
+services:
+  db:
+    image: postgres:17.11-alpine3.24@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: ${DB_MEMORY_LIMIT:-768m}
+    pids_limit: 256
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  db-role-bootstrap:
+    image: postgres:17.11-alpine3.24@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
+    restart: "no"
+    user: postgres
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      APP_DB_USER: ${APP_DB_USER:?APP_DB_USER is required}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?APP_DB_PASSWORD is required}
+      MIGRATION_DB_USER: ${MIGRATION_DB_USER:?MIGRATION_DB_USER is required}
+      MIGRATION_DB_PASSWORD: ${MIGRATION_DB_PASSWORD:?MIGRATION_DB_PASSWORD is required}
+    volumes:
+      - ./docker/db-role-bootstrap.sh:/usr/local/bin/db-role-bootstrap.sh:ro
+    entrypoint: ["/bin/sh", "/usr/local/bin/db-role-bootstrap.sh"]
+    networks:
+      - backend
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: local
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+  db-migrate:
+    image: ${APP_IMAGE:-gomaf/app:current}
+    restart: "no"
+    depends_on:
+      db-role-bootstrap:
+        condition: service_completed_successfully
+    environment:
+      SPRING_MAIN_WEB_APPLICATION_TYPE: none
+      SPRING_MAIN_LAZY_INITIALIZATION: "true"
+      SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/${POSTGRES_DB:?POSTGRES_DB is required}
+      SPRING_DATASOURCE_USERNAME: ${MIGRATION_DB_USER:?MIGRATION_DB_USER is required}
+      SPRING_DATASOURCE_PASSWORD: ${MIGRATION_DB_PASSWORD:?MIGRATION_DB_PASSWORD is required}
+      SPRING_JPA_HIBERNATE_DDL_AUTO: validate
+      SPRING_FLYWAY_ENABLED: "true"
+      APP_MODE: migration
+      APP_ENV: local
+      APP_LOG_DIR: /tmp/gomaf-logs
+      APP_SECURITY_IP_HASH_SECRET: ${APP_SECURITY_IP_HASH_SECRET:?APP_SECURITY_IP_HASH_SECRET is required}
+    networks:
+      - backend
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=96m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: ${APP_MEMORY_LIMIT:-768m}
+    logging:
+      driver: local
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+  db-finalize:
+    image: postgres:17.11-alpine3.24@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
+    restart: "no"
+    user: postgres
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      APP_DB_USER: ${APP_DB_USER:?APP_DB_USER is required}
+      MIGRATION_DB_USER: ${MIGRATION_DB_USER:?MIGRATION_DB_USER is required}
+    volumes:
+      - ./docker/db-finalize-privileges.sh:/usr/local/bin/db-finalize-privileges.sh:ro
+    entrypoint: ["/bin/sh", "/usr/local/bin/db-finalize-privileges.sh"]
+    networks:
+      - backend
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: local
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+  app:
+    init: true
+    image: ${APP_IMAGE:-gomaf/app:current}
+    restart: unless-stopped
+    depends_on:
+      db-finalize:
+        condition: service_completed_successfully
+    environment:
+      SERVER_PORT: "8787"
+      SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/${POSTGRES_DB:?POSTGRES_DB is required}
+      SPRING_DATASOURCE_USERNAME: ${APP_DB_USER:?APP_DB_USER is required}
+      SPRING_DATASOURCE_PASSWORD: ${APP_DB_PASSWORD:?APP_DB_PASSWORD is required}
+      SPRING_JPA_HIBERNATE_DDL_AUTO: validate
+      SPRING_FLYWAY_ENABLED: "false"
+      APP_MODE: runtime
+      APP_ADMIN_USERNAME: ${APP_ADMIN_USERNAME:?APP_ADMIN_USERNAME is required}
+      APP_ADMIN_PASSWORD: ${APP_ADMIN_PASSWORD:?APP_ADMIN_PASSWORD is required}
+      APP_ENV: production
+      APP_SECURITY_IP_HASH_SECRET: ${APP_SECURITY_IP_HASH_SECRET:?APP_SECURITY_IP_HASH_SECRET is required}
+      APP_TRUST_PROXY_HEADERS: "true"
+      SERVER_FORWARD_HEADERS_STRATEGY: NATIVE
+      APP_LOG_DIR: /var/log/gomaf
+      SESSION_COOKIE_SECURE: "true"
+    volumes:
+      - /srv/gomaf-logs/app:/var/log/gomaf
+    expose:
+      - "8787"
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent --show-error http://127.0.0.1:8787/healthz >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 4s
+      retries: 12
+      start_period: 20s
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: ${APP_MEMORY_LIMIT:-768m}
+    stop_grace_period: 30s
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  caddy:
+    init: true
+    image: caddy:2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      DOMAIN: ${DOMAIN:?DOMAIN is required}
+    ports:
+      - "80:80/tcp"
+      - "443:443/tcp"
+      - "443:443/udp"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      - /srv/gomaf-logs/caddy:/var/log/caddy
+    networks:
+      - edge
+      - backend
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m,mode=1777
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: ${CADDY_MEMORY_LIMIT:-256m}
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+networks:
+  edge:
+  backend:
+    internal: true
+
+volumes:
+  postgres_data:
+    name: gomaf_postgres_data
+  caddy_data:
+    name: gomaf_caddy_data
+  caddy_config:
+    name: gomaf_caddy_config

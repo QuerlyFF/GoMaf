@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+set -euo pipefail
+exec /usr/bin/aide --config=/etc/aide/gomaf-aide.conf --check

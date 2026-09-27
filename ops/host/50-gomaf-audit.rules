@@ -1,0 +1,49 @@
+## GoMaf security audit rules
+-b 8192
+-f 1
+
+# Root command execution
+-a always,exit -F arch=b64 -S execve -F euid=0 -k root_exec
+-a always,exit -F arch=b32 -S execve -F euid=0 -k root_exec
+
+# Authentication and privilege configuration
+-w /etc/ssh/ -p wa -k ssh_config
+-w /etc/sudoers -p wa -k sudoers
+-w /etc/sudoers.d/ -p wa -k sudoers
+-w /etc/pam.d/ -p wa -k pam_config
+
+# Service and host security configuration
+-w /etc/systemd/system/ -p wa -k systemd_local
+-w /etc/ufw/ -p wa -k firewall_config
+-w /etc/sysctl.d/ -p wa -k sysctl_config
+-w /etc/docker/ -p wa -k docker_config
+
+# GoMaf privileged control plane
+-w /etc/gomaf/ -p wa -k gomaf_secrets
+-w /etc/gomaf-owner-mcp/ -p wa -k gomaf_mcp_config
+-w /opt/gomaf-owner-mcp/ -p wa -k gomaf_mcp_code
+-w /opt/remote-desktop-commander/ -p wa -k rdc_code
+
+# Production configuration and backup metadata
+-w /srv/gomaf/compose.prod.yaml -p wa -k gomaf_compose
+-w /srv/gomaf/caddy/ -p wa -k gomaf_caddy
+-w /srv/gomaf/.deploy/active_release -p wa -k gomaf_release_pointer
+-w /srv/gomaf/.deploy/current_image -p wa -k gomaf_release_pointer
+-w /srv/gomaf/.deploy/current_source_hash -p wa -k gomaf_release_pointer
+
+# Identity and SSH trust material
+-w /etc/passwd -p wa -k identity
+-w /etc/group -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/gshadow -p wa -k identity
+-w /root/.ssh/ -p wa -k ssh_keys
+-w /home/opsadmin/.ssh/ -p wa -k ssh_keys
+-w /home/mafia/.ssh/ -p wa -k ssh_keys
+
+# Patched Internet-facing Caddy binary
+-w /opt/gomaf-caddy-sec/ -p wa -k gomaf_caddy_binary
+-w /etc/fail2ban/ -p wa -k fail2ban_config
+-w /etc/audit/ -p wa -k audit_config
+-w /etc/aide/ -p wa -k aide_config
+-w /var/lib/docker/volumes/gomaf_postgres_data/_data/pg_hba.conf -p wa -k postgres_auth
+-w /var/lib/docker/volumes/gomaf_postgres_data/_data/postgresql.conf -p wa -k postgres_config

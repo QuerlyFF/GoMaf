@@ -1,0 +1,8 @@
+GoMaf v11 development worktree
+Baseline: GoMaf v10.2.1
+Current gate: V11-G1 Foundation
+Production release: NO
+Production cutover: NO
+Legacy Thymeleaf: retired in WP11-022 after accepted v11 cutover
+React production integration: deferred to V11-G4
+Final G1 acceptance command: ./ops/v11-g1-online-gate.sh

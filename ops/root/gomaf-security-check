@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+echo "===== GoMaf security check $(date -u --iso-8601=seconds) ====="
+
+ACTIVE_RELEASE_FILE=/srv/gomaf/.deploy/active_release
+[[ -r "$ACTIVE_RELEASE_FILE" ]] || { echo "active release pointer missing" >&2; exit 1; }
+ACTIVE_RELEASE="$(cat "$ACTIVE_RELEASE_FILE")"
+case "$ACTIVE_RELEASE" in
+  /srv/gomaf/.deploy/releases/*) ;;
+  *) echo "unsafe active release path: $ACTIVE_RELEASE" >&2; exit 1 ;;
+esac
+[[ -d "$ACTIVE_RELEASE" && ! -L "$ACTIVE_RELEASE" && -x "$ACTIVE_RELEASE/ops/production-audit.sh" ]]   || { echo "active release production audit missing/unsafe" >&2; exit 1; }
+GOMAF_RUNTIME_DIR=/srv/gomaf/.deploy GOMAF_ENV_FILE=/etc/gomaf/production.env "$ACTIVE_RELEASE/ops/production-audit.sh"
+
+echo "===== owner MCP npm audit ====="
+(
+  cd /opt/gomaf-owner-mcp
+  npm audit --omit=dev --audit-level=high
+)
+
+echo "===== Remote Desktop Commander npm audit ====="
+(
+  cd /opt/remote-desktop-commander
+  npm audit --omit=dev --audit-level=high
+)
+
+echo "===== package updates ====="
+pending="$(apt-get -s dist-upgrade 2>/dev/null | grep -c '^Inst ' || true)"
+echo "pending_upgrades=$pending"
+if [ "$pending" -ne 0 ]; then
+  apt-get -s dist-upgrade 2>/dev/null | grep '^Inst ' || true
+  exit 20
+fi
+
+echo "===== reboot requirement ====="
+if [[ -e /var/run/reboot-required ]]; then
+  echo "reboot_required=yes"
+  cat /var/run/reboot-required.pkgs 2>/dev/null || true
+  exit 21
+fi
+echo "reboot_required=no"
+
+echo "===== auditd ====="
+auditctl -s
+lost="$(auditctl -s | awk '$1=="lost"{print $2}')"
+test "${lost:-1}" = 0
+
+echo "===== fail2ban ====="
+fail2ban-client status sshd
+fail2ban-client status recidive
+
+echo "===== containers ====="
+for c in gomaf-db-1 gomaf-app-1 gomaf-caddy-1; do
+  docker inspect -f '{{.Name}} status={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$c"
+done
+
+echo "===== public health ====="
+curl -fsS -o /dev/null -w 'gomaf.online HTTP=%{http_code} time=%{time_total}s\n' https://gomaf.online/
+
+echo "SECURITY CHECK PASS"

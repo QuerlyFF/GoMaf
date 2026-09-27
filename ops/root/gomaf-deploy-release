@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+source /usr/local/libexec/gomaf-release-common
+release_require_root_no_args "$@"
+release_require_host_state
+exec 9>"$RELEASE_STATE_DIR/predeploy.lock"
+flock -n 9 || release_die "another release predeploy/deploy is running"
+archive="$RELEASE_APPROVED_DIR/candidate.zip"; evidence="$RELEASE_APPROVED_DIR/predeploy-evidence.env"
+[[ -f "$evidence" && ! -L "$evidence" ]] || release_die "root-owned PREDEPLOY PASS evidence missing"
+
+txn="$(mktemp -d "$RELEASE_STATE_DIR/.deploy.XXXXXX")"
+cleanup(){ rm -rf -- "$txn"; }
+trap cleanup EXIT INT TERM
+release_verify_and_extract "$archive" "$txn/extracted"
+release_check_monotonic_and_current
+archive_sha="$(sha256sum "$archive" | awk '{print $1}')"
+grep -qx 'STATUS=PASS' "$evidence" || release_die "PREDEPLOY status is not PASS"
+grep -qx 'WORK_PACKAGE=WP11-023' "$evidence" || release_die "PREDEPLOY work package mismatch"
+grep -qx "ARCHIVE_SHA256=$archive_sha" "$evidence" || release_die "PREDEPLOY archive hash mismatch"
+grep -qx "RELEASE_SEQUENCE=$RELEASE_SEQUENCE" "$evidence" || release_die "PREDEPLOY sequence mismatch"
+grep -qx "EXPECTED_CURRENT_SOURCE_HASH=$RELEASE_EXPECTED_CURRENT" "$evidence" || release_die "PREDEPLOY baseline mismatch"
+candidate_source_hash="$(awk -F= '$1=="CANDIDATE_SOURCE_HASH"{print substr($0,index($0,"=")+1)}' "$evidence")"
+candidate_image="$(awk -F= '$1=="CANDIDATE_IMAGE"{print substr($0,index($0,"=")+1)}' "$evidence")"
+candidate_image_id="$(awk -F= '$1=="CANDIDATE_IMAGE_ID"{print substr($0,index($0,"=")+1)}' "$evidence")"
+[[ "$candidate_source_hash" =~ ^[0-9a-f]{12}$ ]] || release_die "PREDEPLOY candidate source hash invalid"
+[[ "$candidate_image_id" =~ ^sha256:[0-9a-f]{64}$ ]] || release_die "PREDEPLOY candidate image id invalid"
+computed_source_hash="$(bash "$RELEASE_EXTRACTED_ROOT/ops/source-hash.sh" "$RELEASE_EXTRACTED_ROOT")"
+[[ "$candidate_source_hash" == "$computed_source_hash" ]] || release_die "PREDEPLOY candidate source hash does not match approved archive"
+archive_short="$(printf '%.12s' "$archive_sha")"
+expected_candidate_image="gomaf/wp11-023-approved:$candidate_source_hash-$archive_short"
+[[ "$candidate_image" == "$expected_candidate_image" ]] || release_die "PREDEPLOY candidate image tag mismatch"
+actual_candidate_id="$(docker image inspect -f '{{.Id}}' "$candidate_image" 2>/dev/null || true)"
+[[ "$actual_candidate_id" == "$candidate_image_id" ]] || release_die "PREDEPLOY exact candidate image missing or image id changed"
+[[ "$(docker image inspect -f '{{index .Config.Labels "com.gomaf.source-hash"}}' "$candidate_image")" == "$candidate_source_hash" ]] || release_die "PREDEPLOY candidate image source label mismatch"
+[[ "$(docker image inspect -f '{{index .Config.Labels "com.gomaf.application"}}' "$candidate_image")" == classic-mafia ]] || release_die "PREDEPLOY candidate image application label mismatch"
+
+[[ -d /srv/gomaf && ! -L /srv/gomaf ]] || release_die "/srv/gomaf missing/unsafe"
+rsync -a --delete --exclude '.deploy/' --exclude '.audit/' "$RELEASE_EXTRACTED_ROOT/" /srv/gomaf/
+chown -R root:root /srv/gomaf
+export GOMAF_RUNTIME_DIR="$RELEASE_RUNTIME_DIR" GOMAF_ENV_FILE="$RELEASE_ENV"
+export GOMAF_APPROVED_IMAGE="$candidate_image"
+export GOMAF_APPROVED_IMAGE_ID="$candidate_image_id"
+export GOMAF_APPROVED_SOURCE_HASH="$candidate_source_hash"
+release_log "PREDEPLOY PASS and exact image id verified; starting fail-closed production deploy"
+set +e
+"$RELEASE_EXTRACTED_ROOT/ops/deploy.sh" 2>&1 | tee "$txn/deploy.log"
+deploy_rc=${PIPESTATUS[0]}
+set -e
+if (( deploy_rc != 0 )); then
+  release_log "deploy.sh failed; preserving evidence and reconciling source/runtime state before returning FAIL"
+  printf 'deploy-sh\n' > "$txn/failure-stage.txt"
+  cp "$evidence" "$txn/predeploy-evidence.env"
+  post_hash="$(cat "$RELEASE_RUNTIME_DIR/current_source_hash" 2>/dev/null || true)"
+  rollback_rc=0
+  if [[ "$post_hash" != "$RELEASE_EXPECTED_CURRENT" ]]; then
+    release_log "deploy.sh changed active source metadata before failing; automatic rollback is mandatory"
+    set +e
+    bash /srv/gomaf/ops/rollback.sh 2>&1 | tee "$txn/automatic-rollback.log"
+    rollback_rc=${PIPESTATUS[0]}
+    set -e
+  fi
+
+  source_restore_rc=0
+  active_after="$(cat "$RELEASE_RUNTIME_DIR/active_release" 2>/dev/null || true)"
+  if [[ "$active_after" == "$RELEASE_RUNTIME_DIR/releases/"* && -d "$active_after" && ! -L "$active_after" ]]; then
+    set +e
+    {
+      rsync -a --delete --exclude '.deploy/' --exclude '.audit/' "$active_after/" /srv/gomaf/ && chown -R root:root /srv/gomaf
+    } >"$txn/source-restore.log" 2>&1
+    source_restore_rc=$?
+    set -e
+  else
+    printf 'active release is missing or unsafe: %s\n' "$active_after" > "$txn/source-restore.log"
+    source_restore_rc=1
+  fi
+
+  (
+    cd "$txn"
+    files=(deploy.log predeploy-evidence.env failure-stage.txt source-restore.log)
+    [[ -f automatic-rollback.log ]] && files+=(automatic-rollback.log)
+    sha256sum "${files[@]}" > FAILURE-SHA256SUMS.txt
+    tar -czf deployment-failure-evidence.tar.gz "${files[@]}" FAILURE-SHA256SUMS.txt
+  )
+  install -m 0600 -o mafia -g mafia "$txn/deployment-failure-evidence.tar.gz" "$RELEASE_INCOMING_DIR/deployment-failure-evidence.tar.gz"
+  (( rollback_rc == 0 )) || release_die "CRITICAL: deploy.sh failed after committing candidate and automatic rollback also failed (deploy=$deploy_rc rollback=$rollback_rc)"
+  (( source_restore_rc == 0 )) || release_die "CRITICAL: deploy.sh failed and active source tree could not be restored (deploy=$deploy_rc)"
+  release_die "deploy.sh failed with exit code $deploy_rc; recovery path completed; anti-replay state was not committed"
+fi
+grep -Fq '[gomaf] DEPLOY PASS:' "$txn/deploy.log" || release_die "deploy.sh exited zero without DEPLOY PASS marker"
+
+release_log "running post-deploy production audit before committing anti-replay state"
+set +e
+bash /srv/gomaf/ops/production-audit.sh 2>&1 | tee "$txn/production-audit.log"
+audit_rc=${PIPESTATUS[0]}
+set -e
+audit_marker=0
+grep -Fxq 'PRODUCTION AUDIT PASS' "$txn/production-audit.log" && audit_marker=1
+if (( audit_rc != 0 || audit_marker != 1 )); then
+  release_log "production audit failed; automatically rolling back the public candidate"
+  set +e
+  bash /srv/gomaf/ops/rollback.sh 2>&1 | tee "$txn/automatic-rollback.log"
+  rollback_rc=${PIPESTATUS[0]}
+  set -e
+
+  source_restore_rc=0
+  if (( rollback_rc == 0 )); then
+    active_after="$(cat "$RELEASE_RUNTIME_DIR/active_release" 2>/dev/null || true)"
+    if [[ "$active_after" == "$RELEASE_RUNTIME_DIR/releases/"* && -d "$active_after" && ! -L "$active_after" ]]; then
+      set +e
+      { rsync -a --delete --exclude '.deploy/' --exclude '.audit/' "$active_after/" /srv/gomaf/ && chown -R root:root /srv/gomaf; } >"$txn/source-restore.log" 2>&1
+      source_restore_rc=$?
+      set -e
+    else
+      printf 'active release is missing or unsafe after rollback: %s\n' "$active_after" > "$txn/source-restore.log"
+      source_restore_rc=1
+    fi
+  else
+    printf 'source restore skipped because automatic rollback failed\n' > "$txn/source-restore.log"
+    source_restore_rc=1
+  fi
+
+  # Preserve failure evidence even though this helper returns non-zero. The
+  # anti-replay sequence is intentionally NOT committed on this path.
+  cp "$evidence" "$txn/predeploy-evidence.env"
+  printf 'post-deploy-audit\n' > "$txn/failure-stage.txt"
+  (
+    cd "$txn"
+    sha256sum deploy.log production-audit.log automatic-rollback.log source-restore.log predeploy-evidence.env failure-stage.txt > FAILURE-SHA256SUMS.txt
+    tar -czf deployment-failure-evidence.tar.gz deploy.log production-audit.log automatic-rollback.log source-restore.log predeploy-evidence.env failure-stage.txt FAILURE-SHA256SUMS.txt
+  )
+  install -m 0600 -o mafia -g mafia "$txn/deployment-failure-evidence.tar.gz" "$RELEASE_INCOMING_DIR/deployment-failure-evidence.tar.gz"
+  if (( rollback_rc != 0 )); then
+    release_die "CRITICAL: production audit failed and automatic rollback also failed (audit=$audit_rc rollback=$rollback_rc)"
+  fi
+  (( source_restore_rc == 0 )) || release_die "CRITICAL: production audit failed, rollback passed, but active source tree restoration failed"
+  release_die "production audit failed; automatic rollback PASS; active source restored; anti-replay state was not committed"
+fi
+
+printf '%s\n' "$RELEASE_SEQUENCE" > "$RELEASE_STATE_DIR/last_sequence.tmp"
+chmod 0600 "$RELEASE_STATE_DIR/last_sequence.tmp"; mv -f "$RELEASE_STATE_DIR/last_sequence.tmp" "$RELEASE_STATE_DIR/last_sequence"
+(
+  cd "$txn"
+  cp "$evidence" predeploy-evidence.env
+  sha256sum deploy.log production-audit.log predeploy-evidence.env > SHA256SUMS.txt
+  tar -czf deployment-evidence.tar.gz deploy.log production-audit.log predeploy-evidence.env SHA256SUMS.txt
+)
+install -m 0600 -o mafia -g mafia "$txn/deployment-evidence.tar.gz" "$RELEASE_INCOMING_DIR/deployment-evidence.tar.gz"
+docker image rm "$candidate_image" >/dev/null 2>&1 || true
+rm -f -- "$RELEASE_APPROVED_DIR/candidate.zip" "$RELEASE_APPROVED_DIR/predeploy-evidence.env"
+release_log "DEPLOY PASS and PRODUCTION AUDIT PASS committed for exact image $candidate_image_id release sequence $RELEASE_SEQUENCE"

@@ -1,0 +1,133 @@
+{
+    servers {
+        max_header_size 32KB
+    }
+}
+
+{$DOMAIN} {
+    encode zstd gzip
+
+    request_body {
+        max_size 4MB
+    }
+
+    header {
+        -Server
+        Strict-Transport-Security "max-age=31536000"
+    }
+
+    # Drop common automated probes at the Internet-facing edge before they can
+    # reach Spring Boot. They are still present in Caddy access logs.
+    @blocked_probes path \
+        /.env \
+        /.env.* \
+        /.git \
+        /.git/* \
+        /.svn \
+        /.svn/* \
+        /.hg \
+        /.hg/* \
+        /actuator \
+        /actuator/* \
+        /wp-admin \
+        /wp-admin/* \
+        /wp-login.php \
+        /phpmyadmin \
+        /phpmyadmin/* \
+        /phpMyAdmin \
+        /phpMyAdmin/* \
+        /vendor/phpunit/* \
+        /server-status
+    respond @blocked_probes 404
+
+    reverse_proxy app:8787 {
+        health_uri /healthz
+        health_interval 15s
+        health_timeout 3s
+        health_status 200
+        fail_duration 10s
+        max_fails 3
+        lb_try_duration 5s
+
+        # Caddy is the only route to the internal backend. Reset externally
+        # supplied forwarding metadata and send values derived by Caddy itself.
+        header_up -Forwarded
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+        header_up X-Forwarded-Host {host}
+
+        transport http {
+            dial_timeout 3s
+            response_header_timeout 30s
+        }
+    }
+
+    log {
+        output file /var/log/caddy/access.log {
+            mode 0640
+            roll_size 25MiB
+            roll_at 00:00
+            roll_keep 20
+            roll_keep_for 720h
+        }
+        format json
+    }
+}
+
+mcp.gomaf.online {
+    request_body {
+        max_size 8MB
+    }
+
+    header {
+        -Server
+        Strict-Transport-Security "max-age=31536000"
+    }
+
+    tls {
+        client_auth {
+            mode require_and_verify
+            trust_pool file /etc/caddy/openai-mtls/openai-connectors-mtls-ca.pem
+        }
+    }
+
+    @mcp_secret_path {
+        path /{$MCP_ROUTE_SECRET}/mcp
+    }
+    log_skip @mcp_secret_path
+
+    @mcp {
+        path /{$MCP_ROUTE_SECRET}/mcp
+        expression `"mtls.prod.connectors.openai.com" in {http.request.tls.client.san.dns_names}`
+    }
+
+    handle @mcp {
+        rewrite * /mcp
+
+        reverse_proxy unix//run/gomaf-owner-mcp/mcp.sock {
+            header_up Host localhost
+            header_up -Forwarded
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+            header_up X-Forwarded-Host {host}
+
+            flush_interval -1
+        }
+    }
+
+    handle {
+        respond 404
+    }
+
+    log {
+        output file /var/log/caddy/mcp-access.log {
+            mode 0640
+            roll_size 10MiB
+            roll_at 00:00
+            roll_keep 10
+            roll_keep_for 240h
+        }
+        format json
+    }
+}
+

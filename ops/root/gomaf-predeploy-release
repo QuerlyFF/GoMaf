@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+source /usr/local/libexec/gomaf-release-common
+release_require_root_no_args "$@"
+release_require_host_state
+exec 9>"$RELEASE_STATE_DIR/predeploy.lock"
+flock -n 9 || release_die "another release predeploy/deploy is running"
+
+incoming_zip="$RELEASE_INCOMING_DIR/candidate.zip"
+[[ -f "$incoming_zip" && ! -L "$incoming_zip" ]] || release_die "candidate.zip missing/unsafe"
+[[ "$(stat -c '%U' "$incoming_zip")" == mafia ]] \
+  || release_die "incoming candidate must be owned by mafia"
+
+txn="$(mktemp -d "$RELEASE_STATE_DIR/.predeploy.XXXXXX")"
+cleanup(){ rm -rf -- "$txn"; }
+trap cleanup EXIT INT TERM
+mv -- "$incoming_zip" "$txn/candidate.zip"
+chmod 0600 "$txn/candidate.zip"; chown root:root "$txn/candidate.zip"
+release_verify_and_extract "$txn/candidate.zip" "$txn/extracted"
+release_check_monotonic_and_current
+archive_sha="$(sha256sum "$txn/candidate.zip" | awk '{print $1}')"
+[[ -x "$RELEASE_EXTRACTED_ROOT/ops/wp11-023-predeploy.sh" ]] || release_die "candidate lacks executable WP11-023 predeploy gate"
+evidence_tmp="$txn/predeploy-evidence.env"
+export GOMAF_RUNTIME_DIR="$RELEASE_RUNTIME_DIR" GOMAF_ENV_FILE="$RELEASE_ENV"
+release_log "running candidate-bound WP11-023 predeploy gate; production rollout is not authorized yet"
+"$RELEASE_EXTRACTED_ROOT/ops/wp11-023-predeploy.sh" "$archive_sha" "$RELEASE_SEQUENCE" "$RELEASE_EXPECTED_CURRENT" "$evidence_tmp"
+[[ -f "$evidence_tmp" && ! -L "$evidence_tmp" ]] || release_die "predeploy evidence missing"
+grep -qx 'STATUS=PASS' "$evidence_tmp" || release_die "predeploy did not emit PASS"
+grep -qx "WORK_PACKAGE=WP11-023" "$evidence_tmp" || release_die "predeploy work package mismatch"
+grep -qx "ARCHIVE_SHA256=$archive_sha" "$evidence_tmp" || release_die "predeploy evidence archive hash mismatch"
+grep -qx "RELEASE_SEQUENCE=$RELEASE_SEQUENCE" "$evidence_tmp" || release_die "predeploy evidence sequence mismatch"
+grep -qx "EXPECTED_CURRENT_SOURCE_HASH=$RELEASE_EXPECTED_CURRENT" "$evidence_tmp" || release_die "predeploy baseline mismatch"
+candidate_source_hash="$(awk -F= '$1=="CANDIDATE_SOURCE_HASH"{print substr($0,index($0,"=")+1)}' "$evidence_tmp")"
+candidate_image="$(awk -F= '$1=="CANDIDATE_IMAGE"{print substr($0,index($0,"=")+1)}' "$evidence_tmp")"
+candidate_image_id="$(awk -F= '$1=="CANDIDATE_IMAGE_ID"{print substr($0,index($0,"=")+1)}' "$evidence_tmp")"
+[[ "$candidate_source_hash" =~ ^[0-9a-f]{12}$ ]] || release_die "predeploy candidate source hash invalid"
+[[ "$candidate_image_id" =~ ^sha256:[0-9a-f]{64}$ ]] || release_die "predeploy candidate image id invalid"
+computed_source_hash="$(bash "$RELEASE_EXTRACTED_ROOT/ops/source-hash.sh" "$RELEASE_EXTRACTED_ROOT")"
+[[ "$candidate_source_hash" == "$computed_source_hash" ]] || release_die "predeploy candidate source hash does not match extracted archive"
+archive_short="$(printf '%.12s' "$archive_sha")"
+expected_candidate_image="gomaf/wp11-023-approved:$candidate_source_hash-$archive_short"
+[[ "$candidate_image" == "$expected_candidate_image" ]] || release_die "predeploy candidate image tag mismatch"
+actual_candidate_id="$(docker image inspect -f '{{.Id}}' "$candidate_image" 2>/dev/null || true)"
+[[ "$actual_candidate_id" == "$candidate_image_id" ]] || release_die "predeploy exact candidate image missing or image id changed"
+[[ "$(docker image inspect -f '{{index .Config.Labels "com.gomaf.source-hash"}}' "$candidate_image")" == "$candidate_source_hash" ]] || release_die "predeploy candidate image source label mismatch"
+[[ "$(docker image inspect -f '{{index .Config.Labels "com.gomaf.application"}}' "$candidate_image")" == classic-mafia ]] || release_die "predeploy candidate image application label mismatch"
+screenshot_manifest="$RELEASE_EXTRACTED_ROOT/verification/wp11-023/predeploy/test-results/SCREENSHOT-SHA256SUMS.txt"
+[[ -f "$screenshot_manifest" && ! -L "$screenshot_manifest" ]] || release_die "predeploy screenshot manifest missing"
+screenshot_sha="$(sha256sum "$screenshot_manifest" | awk '{print $1}')"
+grep -qx "SCREENSHOT_MANIFEST_SHA256=$screenshot_sha" "$evidence_tmp" || release_die "predeploy screenshot evidence mismatch"
+grep -qx 'SCREENSHOT_COUNT=215' "$evidence_tmp" || release_die "predeploy screenshot count mismatch"
+( cd "$(dirname "$screenshot_manifest")" && sha256sum -c "$(basename "$screenshot_manifest")" >/dev/null ) || release_die "predeploy screenshot checksums invalid"
+
+old_candidate_image=''
+if [[ -f "$RELEASE_APPROVED_DIR/predeploy-evidence.env" && ! -L "$RELEASE_APPROVED_DIR/predeploy-evidence.env" ]]; then
+  old_candidate_image="$(awk -F= '$1=="CANDIDATE_IMAGE"{print substr($0,index($0,"=")+1)}' "$RELEASE_APPROVED_DIR/predeploy-evidence.env" 2>/dev/null || true)"
+fi
+rm -f -- "$RELEASE_APPROVED_DIR/candidate.zip" "$RELEASE_APPROVED_DIR/predeploy-evidence.env"
+if [[ -n "$old_candidate_image" && "$old_candidate_image" != "$candidate_image" && "$old_candidate_image" == gomaf/wp11-023-approved:* ]]; then
+  docker image rm "$old_candidate_image" >/dev/null 2>&1 || true
+fi
+install -m 0600 -o root -g root "$txn/candidate.zip" "$RELEASE_APPROVED_DIR/candidate.zip"
+install -m 0600 -o root -g root "$evidence_tmp" "$RELEASE_APPROVED_DIR/predeploy-evidence.env"
+
+# Return a non-secret, self-verifying evidence archive to the deployment identity.
+evidence_stage="$txn/evidence-stage"
+install -d -m 0700 "$evidence_stage"
+cp -a "$RELEASE_EXTRACTED_ROOT/verification/wp11-023/predeploy" "$evidence_stage/predeploy-report"
+install -m 0600 "$evidence_tmp" "$evidence_stage/predeploy-evidence.env"
+printf '%s  candidate.zip\n' "$archive_sha" > "$evidence_stage/candidate.sha256"
+(
+  cd "$evidence_stage"
+  sha256sum predeploy-evidence.env candidate.sha256 > SHA256SUMS.txt
+  find predeploy-report -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum >> SHA256SUMS.txt
+  tar -czf "$txn/final-predeploy-evidence.tar.gz" predeploy-evidence.env candidate.sha256 predeploy-report SHA256SUMS.txt
+)
+rm -f -- "$RELEASE_INCOMING_DIR/final-predeploy-evidence.tar.gz"
+install -m 0600 -o mafia -g mafia "$txn/final-predeploy-evidence.tar.gz" "$RELEASE_INCOMING_DIR/final-predeploy-evidence.tar.gz"
+release_log "PREDEPLOY PASS stored for archive $archive_sha; production was not rolled out"

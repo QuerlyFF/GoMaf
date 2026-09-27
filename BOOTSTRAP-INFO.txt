@@ -1,0 +1,5 @@
+work_package=WP11-023
+purpose=online-finalization-and-signed-predeploy-bootstrap
+production_secrets_in_archive=no
+production_rollout_directly_from_bootstrap=no
+final_candidate_created_on_vps_then_downloaded_and_signed_on_local_pc=yes

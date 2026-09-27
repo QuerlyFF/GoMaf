@@ -1,0 +1,39 @@
+#!/usr/bin/env sh
+set -eu
+
+MAVEN_VERSION=3.9.16
+MAVEN_SHA512=831a8591fe20c8243b1dbe7d71e3244f31d1665b0804b2e825e38cbbe5ce0cafb8338851f90780735568773e0a6cd07bbec107cda0b896b008b861075358b6f6
+CACHE_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/gomaf-tools"
+MAVEN_HOME="$CACHE_ROOT/apache-maven-$MAVEN_VERSION"
+ARCHIVE="$CACHE_ROOT/apache-maven-$MAVEN_VERSION-bin.tar.gz"
+URL="https://downloads.apache.org/maven/maven-3/$MAVEN_VERSION/binaries/apache-maven-$MAVEN_VERSION-bin.tar.gz"
+
+if [ ! -x "$MAVEN_HOME/bin/mvn" ]; then
+  mkdir -p "$CACHE_ROOT"
+  if [ ! -f "$ARCHIVE" ]; then
+    tmp="$ARCHIVE.part"
+    rm -f "$tmp"
+    if command -v curl >/dev/null 2>&1; then
+      curl --fail --location --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 300 \
+        --output "$tmp" "$URL"
+    elif command -v wget >/dev/null 2>&1; then
+      wget --https-only --timeout=15 --tries=3 -O "$tmp" "$URL"
+    else
+      echo 'ERROR: curl or wget is required to bootstrap Maven.' >&2
+      exit 1
+    fi
+    mv "$tmp" "$ARCHIVE"
+  fi
+
+  actual="$(sha512sum "$ARCHIVE" | awk '{print $1}')"
+  if [ "$actual" != "$MAVEN_SHA512" ]; then
+    echo 'ERROR: Apache Maven archive SHA-512 mismatch.' >&2
+    rm -f "$ARCHIVE"
+    exit 1
+  fi
+
+  rm -rf "$MAVEN_HOME"
+  tar -xzf "$ARCHIVE" -C "$CACHE_ROOT"
+fi
+
+exec "$MAVEN_HOME/bin/mvn" "$@"

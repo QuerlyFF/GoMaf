@@ -1,0 +1,9 @@
+[recidive]
+enabled = true
+filter = recidive
+logpath = /var/log/fail2ban.log
+backend = auto
+banaction = nftables[type=allports]
+bantime = 1w
+findtime = 1d
+maxretry = 5

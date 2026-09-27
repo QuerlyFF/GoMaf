@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if (( $# < 4 )); then
+  echo "usage: gomaf-safe-build NAME MEMORY_MIB CPUS [buildx-build-options...] CONTEXT" >&2
+  exit 64
+fi
+
+name="$1"
+memory_mib="$2"
+cpus="$3"
+shift 3
+
+[[ "$name" =~ ^gomaf-(stage[0-9]+|predeploy|deploy)-[a-zA-Z0-9_.-]+$ ]] || {
+  echo "invalid build name: $name" >&2
+  exit 64
+}
+[[ "$memory_mib" =~ ^[0-9]+$ ]] || {
+  echo "MEMORY_MIB must be an integer" >&2
+  exit 64
+}
+if (( memory_mib < 256 || memory_mib > 1024 )); then
+  echo "MEMORY_MIB must be between 256 and 1024" >&2
+  exit 64
+fi
+awk -v x="$cpus" 'BEGIN {exit !(x >= 0.10 && x <= 1.0)}' || {
+  echo "CPUS must be between 0.10 and 1.0" >&2
+  exit 64
+}
+(( $# >= 1 )) || { echo "build context missing" >&2; exit 64; }
+
+for arg in "$@"; do
+  case "$arg" in
+    --builder|--builder=*|--resource|--resource=*|--load|--output|--output=*|--push)
+      echo "unsafe/overriding buildx option rejected: $arg" >&2
+      exit 64
+      ;;
+  esac
+done
+
+run_preflight() {
+  local here
+  if [[ -x /usr/local/sbin/gomaf-test-preflight ]]; then
+    /usr/local/sbin/gomaf-test-preflight
+    return
+  fi
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  [[ -x "$here/gomaf-test-preflight" ]] || {
+    echo "gomaf-test-preflight unavailable" >&2
+    exit 1
+  }
+  "$here/gomaf-test-preflight"
+}
+
+run_preflight
+
+quota="$(awk -v x="$cpus" 'BEGIN {printf "%d", x*100000}')"
+min_available_kb=1048576
+max_swap_used_kb=524288
+max_seconds=1800
+low_count=0
+start_epoch="$(date +%s)"
+build_pid=''
+
+cancel_build() {
+  local reason="$1"
+  [[ -n "$build_pid" ]] || return 0
+  if kill -0 "$build_pid" 2>/dev/null; then
+    echo "SAFE_BUILD_CANCEL name=$name reason=$reason" >&2
+    kill -TERM "$build_pid" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+      kill -0 "$build_pid" 2>/dev/null || return 0
+      sleep 1
+    done
+    kill -KILL "$build_pid" 2>/dev/null || true
+  fi
+}
+
+trap 'cancel_build interrupted' INT TERM HUP
+
+echo "SAFE_BUILD_START name=$name memory_mib=$memory_mib cpus=$cpus"
+docker buildx build \
+  --builder default \
+  --resource "memory=${memory_mib}m" \
+  --resource "cpu-quota=$quota" \
+  --resource cpu-period=100000 \
+  --load \
+  "$@" &
+build_pid=$!
+
+while kill -0 "$build_pid" 2>/dev/null; do
+  available_kb="$(awk '/^MemAvailable:/ {print $2; exit}' /proc/meminfo)"
+  swap_total_kb="$(awk '/^SwapTotal:/ {print $2; exit}' /proc/meminfo)"
+  swap_free_kb="$(awk '/^SwapFree:/ {print $2; exit}' /proc/meminfo)"
+  swap_used_kb=$((swap_total_kb - swap_free_kb))
+  now="$(date +%s)"
+
+  if (( available_kb < min_available_kb || swap_used_kb > max_swap_used_kb )); then
+    low_count=$((low_count + 1))
+  else
+    low_count=0
+  fi
+
+  if (( low_count >= 3 )); then
+    cancel_build "host-memory-pressure available_kb=$available_kb swap_used_kb=$swap_used_kb"
+    wait "$build_pid" 2>/dev/null || true
+    exit 75
+  fi
+  if (( now - start_epoch > max_seconds )); then
+    cancel_build "timeout-seconds=$max_seconds"
+    wait "$build_pid" 2>/dev/null || true
+    exit 124
+  fi
+  sleep 2
+done
+
+set +e
+wait "$build_pid"
+rc=$?
+set -e
+build_pid=''
+if (( rc != 0 )); then
+  echo "SAFE_BUILD_FAIL name=$name rc=$rc" >&2
+  exit "$rc"
+fi
+
+run_preflight
+echo "SAFE_BUILD_PASS name=$name"

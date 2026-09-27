@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -u
+
+MIN_AVAILABLE_KB=1048576
+CHECK_SECONDS=5
+CONSECUTIVE_LOW=3
+DOCKER_QUERY_TIMEOUT=3
+DOCKER_STOP_TIMEOUT=12
+low_count=0
+
+while true; do
+  available_kb="$(awk '/^MemAvailable:/ {print $2; exit}' /proc/meminfo)"
+  if [[ "$available_kb" =~ ^[0-9]+$ ]] && (( available_kb < MIN_AVAILABLE_KB )); then
+    low_count=$((low_count + 1))
+  else
+    low_count=0
+  fi
+
+  if (( low_count >= CONSECUTIVE_LOW )); then
+    if ! running="$(/usr/bin/timeout "$DOCKER_QUERY_TIMEOUT" /usr/bin/docker ps --format '{{.Names}}' 2>/dev/null)"; then
+      /usr/bin/logger -p daemon.err -t gomaf-test-memory-guard         "MemAvailable=${available_kb}kB below ${MIN_AVAILABLE_KB}kB; Docker control plane did not answer within ${DOCKER_QUERY_TIMEOUT}s"
+      low_count=0
+      sleep "$CHECK_SECONDS"
+      continue
+    fi
+
+    mapfile -t test_containers < <(
+      printf '%s\n' "$running" |
+      awk '/^gomaf-(stage[0-9]+|predeploy|rehearsal|deploy)-/ || /^buildx_buildkit_gomaf-(stage[0-9]+|predeploy|deploy)-/ {print}'
+    )
+    if (( ${#test_containers[@]} > 0 )); then
+      /usr/bin/logger -p daemon.warning -t gomaf-test-memory-guard         "MemAvailable=${available_kb}kB below ${MIN_AVAILABLE_KB}kB; stopping temporary test containers: ${test_containers[*]}"
+      /usr/bin/timeout "$DOCKER_STOP_TIMEOUT" /usr/bin/docker stop -t 5 "${test_containers[@]}" >/dev/null 2>&1 || true
+    fi
+    low_count=0
+  fi
+
+  sleep "$CHECK_SECONDS"
+done

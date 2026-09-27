@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MIN_AVAILABLE_KB=1572864
+MAX_SWAP_USED_KB=524288
+MAX_LOAD1_MILLI=2000
+MIN_ROOT_FREE_KB=8388608
+
+mode="${1:-full}"
+case "$mode" in
+  full|'') ;;
+  --resources-only) ;;
+  *)
+    echo "usage: gomaf-test-preflight [--resources-only]" >&2
+    exit 64
+    ;;
+esac
+
+available_kb="$(awk '/^MemAvailable:/ {print $2; exit}' /proc/meminfo)"
+swap_total_kb="$(awk '/^SwapTotal:/ {print $2; exit}' /proc/meminfo)"
+swap_free_kb="$(awk '/^SwapFree:/ {print $2; exit}' /proc/meminfo)"
+swap_used_kb=$((swap_total_kb - swap_free_kb))
+load1="$(awk '{print $1}' /proc/loadavg)"
+load1_milli="$(awk -v x="$load1" 'BEGIN {printf "%d", x*1000}')"
+root_free_kb="$(df -Pk / | awk 'NR==2 {print $4}')"
+
+fail=0
+if (( available_kb < MIN_AVAILABLE_KB )); then
+  echo "FAIL MemAvailable=${available_kb}kB < ${MIN_AVAILABLE_KB}kB"
+  fail=1
+fi
+if (( swap_used_kb > MAX_SWAP_USED_KB )); then
+  echo "FAIL SwapUsed=${swap_used_kb}kB > ${MAX_SWAP_USED_KB}kB"
+  fail=1
+fi
+if (( load1_milli > MAX_LOAD1_MILLI )); then
+  echo "FAIL load1=${load1} > 2.0"
+  fail=1
+fi
+if (( root_free_kb < MIN_ROOT_FREE_KB )); then
+  echo "FAIL root free=${root_free_kb}kB < ${MIN_ROOT_FREE_KB}kB"
+  fail=1
+fi
+
+if [[ "$mode" != "--resources-only" ]]; then
+  for c in gomaf-app-1 gomaf-db-1 gomaf-caddy-1; do
+    if ! /usr/bin/timeout 5s /usr/bin/docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$c"; then
+      echo "FAIL production container not running or Docker control plane unavailable: $c"
+      fail=1
+    fi
+  done
+fi
+
+if (( fail != 0 )); then
+  exit 1
+fi
+
+echo "PASS MemAvailable=${available_kb}kB SwapUsed=${swap_used_kb}kB load1=${load1} rootFree=${root_free_kb}kB mode=${mode}"

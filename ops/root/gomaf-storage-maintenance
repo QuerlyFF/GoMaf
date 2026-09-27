@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import subprocess
+import time
+from pathlib import Path
+
+ENV = Path('/etc/gomaf/production.env')
+LOG_ROOT = Path('/srv/gomaf-logs')
+EXPORTS = Path('/srv/gomaf-log-exports')
+BACKUPS = Path('/srv/gomaf-backups')
+RUNTIME = Path('/srv/gomaf/.deploy')
+
+
+def read_nonsecret_int(key: str, default: int) -> int:
+    try:
+        for raw in ENV.read_text().splitlines():
+            if raw.startswith(key + '='):
+                value = raw.split('=', 1)[1].strip().strip("'\"")
+                return int(value)
+    except Exception:
+        pass
+    return default
+
+
+def free_mb(path: Path) -> int:
+    anchor = path if path.exists() else Path('/')
+    return shutil.disk_usage(anchor).free // (1024 * 1024)
+
+
+def unlink(path: Path, reason: str) -> None:
+    try:
+        path.unlink()
+        print(f'DELETED {path} reason={reason}')
+    except FileNotFoundError:
+        pass
+
+
+def prune_exports(retention_days: int, aggressive: bool) -> None:
+    if not EXPORTS.exists():
+        return
+    cutoff = time.time() - retention_days * 86400
+    files = sorted((p for p in EXPORTS.glob('gomaf-logs-*.tar.gz') if p.is_file()), key=lambda p: p.stat().st_mtime)
+    for p in files:
+        if p.stat().st_mtime < cutoff:
+            unlink(p, 'export-retention')
+    if aggressive:
+        files = sorted((p for p in EXPORTS.glob('gomaf-logs-*.tar.gz') if p.is_file()), key=lambda p: p.stat().st_mtime)
+        for p in files[:-2]:
+            unlink(p, 'low-space-export')
+
+
+def prune_rotated_logs(target_free_mb: int, audit_only: bool = False) -> None:
+    now = time.time()
+    app = LOG_ROOT / 'app'
+    caddy = LOG_ROOT / 'caddy'
+    if audit_only:
+        # Security/audit evidence is sacrificed only below the hard protected
+        # floor, and even then keeps at least 30 days where possible.
+        policies = [
+            (app, ('audit.*.log.gz',), 30),
+        ]
+    else:
+        policies = [
+            (app, ('application.*.log.gz',), 7),
+            (caddy, ('access-*.log.gz', 'access-*.log'), 7),
+        ]
+
+    for log_root, patterns, days in policies:
+        if not log_root.exists():
+            continue
+        cutoff = now - days * 86400
+        candidates = []
+        for pattern in patterns:
+            candidates.extend(item for item in log_root.glob(pattern) if item.is_file())
+        for candidate in sorted(set(candidates), key=lambda item: item.stat().st_mtime):
+            if free_mb(Path('/')) >= target_free_mb:
+                return
+            if candidate.stat().st_mtime < cutoff:
+                unlink(candidate, 'low-space-audit' if audit_only else 'low-space-log')
+
+
+def prune_docker_cache(target_free_mb: int) -> None:
+    if free_mb(Path('/')) >= target_free_mb:
+        return
+    docker = shutil.which('docker')
+    if docker is None:
+        print('WARNING=docker-cli-unavailable-for-low-space-prune')
+        return
+
+    env = os.environ.copy()
+    env['DOCKER_CONFIG'] = '/tmp/gomaf-docker-config'
+    # Build cache is reproducible and is the first disposable storage class.
+    # Reclaim progressively: old cache first, then cache older than a day,
+    # then all currently unused build cache. Images are pruned only if they
+    # are dangling; tagged release/rollback images remain protected.
+    commands = [
+        [docker, 'builder', 'prune', '-f', '--filter', 'until=168h'],
+        [docker, 'builder', 'prune', '-f', '--filter', 'until=24h'],
+        [docker, 'builder', 'prune', '-f'],
+        [docker, 'image', 'prune', '-f'],
+    ]
+    for command in commands:
+        if free_mb(Path('/')) >= target_free_mb:
+            break
+        try:
+            result = subprocess.run(command, env=env, text=True, capture_output=True, timeout=120, check=False)
+            print(f'DOCKER_PRUNE exit={result.returncode} command={" ".join(command[1:])}')
+            if result.returncode != 0:
+                print('WARNING=docker-prune-failed')
+        except (OSError, subprocess.TimeoutExpired):
+            print('WARNING=docker-prune-error')
+
+
+def protected_backups(min_keep: int) -> set[Path]:
+    items = sorted((p for p in BACKUPS.glob('gomaf-*.dump') if p.is_file()), key=lambda p: p.stat().st_mtime, reverse=True)
+    protected = {p.resolve() for p in items[:min_keep]}
+    for marker in ('last_predeploy_backup', 'last_successful_backup'):
+        try:
+            p = Path((RUNTIME / marker).read_text().strip()).resolve()
+        except Exception:
+            continue
+        if p.parent == BACKUPS.resolve() and p.exists():
+            protected.add(p)
+    for reason in ('predeploy', 'prerollback', 'prerestore'):
+        p = next((item for item in items if f'-{reason}-' in item.name), None)
+        if p:
+            protected.add(p.resolve())
+    return protected
+
+
+def prune_backups(target_free_mb: int, min_keep: int) -> None:
+    if not BACKUPS.exists() or free_mb(BACKUPS) >= target_free_mb:
+        return
+    protected = protected_backups(min_keep)
+    items = sorted((p for p in BACKUPS.glob('gomaf-*.dump') if p.is_file()), key=lambda p: p.stat().st_mtime)
+    # Low-priority daily/manual copies first, then other unprotected copies.
+    items.sort(key=lambda p: (0 if re.search(r'-(daily|manual)-', p.name) else 1, p.stat().st_mtime))
+    for p in items:
+        if free_mb(BACKUPS) >= target_free_mb:
+            break
+        if p.resolve() in protected:
+            continue
+        unlink(p, 'low-space-backup')
+        unlink(Path(str(p) + '.sha256'), 'low-space-backup-sidecar')
+
+
+def main() -> None:
+    min_free = read_nonsecret_int('BACKUP_MIN_FREE_MB', 2048)
+    target_free = read_nonsecret_int('BACKUP_TARGET_FREE_MB', 3072)
+    min_keep = max(2, read_nonsecret_int('BACKUP_MIN_KEEP', 3))
+    export_retention = read_nonsecret_int('LOG_EXPORT_RETENTION_DAYS', 14)
+
+    before = free_mb(Path('/'))
+    # Heavy validation is blocked below 8 GiB by gomaf-test-preflight.
+    # Reclaim reproducible Docker build cache before that floor becomes a
+    # persistent work blocker. Backups/logs retain their lower protected
+    # thresholds and are not sacrificed merely to restore build headroom.
+    work_free = max(target_free, 8192)
+    if before < work_free:
+        prune_docker_cache(work_free)
+
+    # Generated exports and unprotected backups are considered only at the
+    # normal storage-pressure threshold. Application/access logs come later;
+    # audit logs remain the last resort below the hard protected floor.
+    prune_exports(export_retention, aggressive=free_mb(Path('/')) < target_free)
+    prune_backups(target_free, min_keep)
+    if free_mb(Path('/')) < target_free:
+        prune_rotated_logs(target_free, audit_only=False)
+    if free_mb(Path('/')) < min_free:
+        prune_rotated_logs(min_free, audit_only=True)
+    after = free_mb(Path('/'))
+    print(f'FREE_MB_BEFORE={before}')
+    print(f'FREE_MB_AFTER={after}')
+    if after < min_free:
+        print('WARNING=free-space-below-protected-floor')
+
+
+if __name__ == '__main__':
+    main()

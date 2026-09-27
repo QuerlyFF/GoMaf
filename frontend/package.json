@@ -1,0 +1,51 @@
+{
+  "name": "gomaf-v11-frontend",
+  "private": true,
+  "version": "11.0.0-dev",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "build": "npm run typecheck && npm run audit:public-surface && vite build && npm run audit:dist",
+    "preview": "vite preview",
+    "e2e": "playwright test",
+    "audit:public-surface": "node scripts/public-surface-audit.mjs",
+    "audit:dist": "node scripts/public-surface-audit.mjs --dist"
+  },
+  "dependencies": {
+    "@hookform/resolvers": "3.10.0",
+    "@tanstack/react-query": "5.62.0",
+    "react": "19.1.0",
+    "react-dom": "19.1.0",
+    "react-hook-form": "7.54.0",
+    "react-router-dom": "7.18.2",
+    "zod": "3.24.0"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.13.0",
+    "@eslint/js": "9.17.0",
+    "@playwright/test": "1.55.0",
+    "@testing-library/jest-dom": "6.6.3",
+    "@testing-library/react": "16.1.0",
+    "@testing-library/user-event": "14.5.2",
+    "@types/react": "19.0.0",
+    "@types/react-dom": "19.0.0",
+    "@vitejs/plugin-react": "4.3.4",
+    "eslint": "9.17.0",
+    "eslint-plugin-react-hooks": "5.1.0",
+    "eslint-plugin-react-refresh": "0.4.16",
+    "globals": "15.14.0",
+    "jsdom": "25.0.1",
+    "typescript": "5.7.2",
+    "typescript-eslint": "8.18.0",
+    "vite": "6.4.3",
+    "vitest": "3.0.0"
+  },
+  "packageManager": "npm@10.9.2",
+  "engines": {
+    "node": ">=22.0.0 <23",
+    "npm": ">=10.0.0 <11"
+  }
+}

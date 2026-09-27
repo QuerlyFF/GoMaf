@@ -1,0 +1,25 @@
+GoMaf V11-G1 final verification
+
+Requirements:
+- Ubuntu/Linux with ordinary outbound HTTPS access
+- Java JDK 21+
+- Node.js 22.x with npm 10.x
+- curl or wget
+
+Maven does NOT have to be preinstalled. backend/mvnw bootstraps pinned Apache Maven 3.9.16 and verifies its official SHA-512.
+
+From the extracted worktree root run exactly:
+
+  ./ops/v11-g1-online-gate.sh
+
+On success the script prints:
+
+  V11-G1 PASS
+
+and creates:
+
+  verification/v11-g1/PASS
+  verification/v11-g1/online-gate-report.txt
+  verification/v11-g1/GoMaf-v11-G1-PASS-RETURN.tar.gz
+
+Upload the PASS-RETURN tar.gz back to this chat so the gate evidence can be independently checked.

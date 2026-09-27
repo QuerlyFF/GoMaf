@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+RELEASE_STATE_DIR=/var/lib/gomaf-release
+RELEASE_APPROVED_DIR="$RELEASE_STATE_DIR/approved"
+RELEASE_RUNTIME_DIR=/srv/gomaf/.deploy
+RELEASE_ENV=/etc/gomaf/production.env
+RELEASE_INCOMING_DIR=/srv/gomaf-incoming
+RELEASE_SAFE_ZIP=/usr/local/libexec/gomaf-safe-zip
+
+release_die() { printf 'gomaf-release: ERROR: %s\n' "$*" >&2; exit 1; }
+release_log() { printf 'gomaf-release: %s\n' "$*"; }
+
+release_require_root_no_args() {
+  [[ $EUID -eq 0 ]] || release_die "root privileges required"
+  [[ $# -eq 0 ]] || release_die "this helper accepts no arguments"
+  umask 077
+}
+
+release_require_host_state() {
+  [[ -d "$RELEASE_STATE_DIR" && ! -L "$RELEASE_STATE_DIR" ]] || release_die "unsafe state directory"
+  [[ -d "$RELEASE_APPROVED_DIR" && ! -L "$RELEASE_APPROVED_DIR" ]] || release_die "unsafe approved directory"
+  [[ -f "$RELEASE_ENV" && ! -L "$RELEASE_ENV" ]] || release_die "production.env missing/unsafe"
+  [[ "$(stat -c '%U:%G:%a' "$RELEASE_ENV")" == 'root:root:600' ]] || release_die "production.env must be root:root 0600"
+  [[ -d "$RELEASE_RUNTIME_DIR" && ! -L "$RELEASE_RUNTIME_DIR" ]] || release_die "runtime directory missing/unsafe"
+  command -v sha256sum >/dev/null || release_die "sha256sum missing"
+  command -v python3 >/dev/null || release_die "python3 missing"
+  [[ -f "$RELEASE_SAFE_ZIP" && ! -L "$RELEASE_SAFE_ZIP" && -x "$RELEASE_SAFE_ZIP" ]] || release_die "safe ZIP extractor missing/unsafe"
+  [[ "$(stat -c '%U:%G' "$RELEASE_SAFE_ZIP")" == 'root:root' ]] || release_die "safe ZIP extractor must be root-owned"
+}
+
+release_validate_zip_structure() {
+  local archive="$1"
+  python3 "$RELEASE_SAFE_ZIP" inspect "$archive"
+}
+
+release_verify_and_extract() {
+  local archive="$1" destination="$2" top
+  [[ -f "$archive" && ! -L "$archive" && -s "$archive" ]] || release_die "candidate archive missing/unsafe"
+  top="$(release_validate_zip_structure "$archive")" || release_die "unsafe candidate ZIP"
+  mkdir -m 0700 -p "$destination"
+  [[ -z "$(find "$destination" -mindepth 1 -print -quit)" ]] || release_die "extraction destination must be empty"
+  python3 "$RELEASE_SAFE_ZIP" extract "$archive" "$destination" >/dev/null || release_die "candidate ZIP extraction failed"
+  RELEASE_EXTRACTED_ROOT="$destination/$top"
+  [[ -d "$RELEASE_EXTRACTED_ROOT" && ! -L "$RELEASE_EXTRACTED_ROOT" ]] || release_die "candidate root missing/unsafe"
+  [[ -f "$RELEASE_EXTRACTED_ROOT/RELEASE-SHA256SUMS.txt" ]] || release_die "internal checksum manifest missing"
+  (cd "$RELEASE_EXTRACTED_ROOT" && sha256sum -c RELEASE-SHA256SUMS.txt >/dev/null) \
+    || release_die "internal source checksums failed"
+  release_validate_metadata "$RELEASE_EXTRACTED_ROOT/RELEASE-CANDIDATE.env"
+}
+
+release_validate_metadata() {
+  local file="$1"
+  [[ -f "$file" && ! -L "$file" ]] || release_die "release metadata missing/unsafe"
+  python3 - "$file" <<'PY'
+import re, sys
+from pathlib import Path
+p=Path(sys.argv[1])
+allowed={'FORMAT','WORK_PACKAGE','RELEASE_SEQUENCE','EXPECTED_CURRENT_SOURCE_HASH'}
+data={}
+for raw in p.read_text('utf-8').splitlines():
+    if not raw or raw.startswith('#'): continue
+    if '=' not in raw: raise SystemExit('malformed release metadata')
+    k,v=raw.split('=',1)
+    if k not in allowed or k in data: raise SystemExit('invalid/duplicate release metadata key')
+    data[k]=v
+if set(data)!=allowed: raise SystemExit('missing release metadata key')
+if data['FORMAT']!='1' or data['WORK_PACKAGE']!='WP11-023': raise SystemExit('wrong release format/work package')
+if not re.fullmatch(r'[1-9][0-9]{5,19}', data['RELEASE_SEQUENCE']): raise SystemExit('invalid release sequence')
+if not re.fullmatch(r'[0-9a-f]{12}', data['EXPECTED_CURRENT_SOURCE_HASH']): raise SystemExit('invalid expected source hash')
+PY
+  RELEASE_SEQUENCE="$(grep '^RELEASE_SEQUENCE=' "$file" | cut -d= -f2-)"
+  RELEASE_EXPECTED_CURRENT="$(grep '^EXPECTED_CURRENT_SOURCE_HASH=' "$file" | cut -d= -f2-)"
+}
+
+release_check_monotonic_and_current() {
+  local current last=0
+  current="$(cat "$RELEASE_RUNTIME_DIR/current_source_hash" 2>/dev/null || true)"
+  [[ "$current" == "$RELEASE_EXPECTED_CURRENT" ]] \
+    || release_die "active source hash mismatch: expected $RELEASE_EXPECTED_CURRENT, got ${current:-missing}"
+  if [[ -f "$RELEASE_STATE_DIR/last_sequence" && ! -L "$RELEASE_STATE_DIR/last_sequence" ]]; then
+    last="$(cat "$RELEASE_STATE_DIR/last_sequence")"
+    [[ "$last" =~ ^[0-9]+$ ]] || release_die "invalid last_sequence state"
+  fi
+  (( RELEASE_SEQUENCE > last )) || release_die "release sequence $RELEASE_SEQUENCE is not newer than $last"
+}

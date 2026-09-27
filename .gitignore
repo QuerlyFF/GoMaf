@@ -1,0 +1,33 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+*.jks
+*.keystore
+id_rsa
+id_ed25519
+secrets/
+credentials/
+config/*.env
+production.env
+
+# Runtime state, releases, logs and backups
+.deploy/
+.audit/
+backups/
+logs/
+*.log
+*.dump
+
+# Build tools and local editor files
+target/
+node_modules/
+dist/
+coverage/
+.idea/
+.vscode/
+.DS_Store
